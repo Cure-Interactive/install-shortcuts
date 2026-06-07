@@ -1,29 +1,23 @@
 #!/usr/bin/env python3
 # =============================================================================
-# [🪟 Windows Installer] [🔗 Start Menu Shortcuts] Cure Interactive
+# Windows Start Menu shortcut sync for Cure Interactive tools.
 # =============================================================================
-# Scans the project (one directory above this script's folder) for Python GUI apps
-# that contain: APP_TITLE = "..."
+# Scans the directory above this script's folder for Python GUI apps that define:
+#   APP_TITLE = "..."
 #
-# For each match:
-# - Creates a .lnk shortcut in:
-#   C:\Users\<user>\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Cure Interactive
-#   (resolved via %APPDATA% for the current user)
-# - Shortcut name is the extracted title, with trailing " - Cure Interactive" removed.
-# - Uses sibling icon.ico next to each app script.
+# For each match, creates or updates a .lnk shortcut in:
+#   %APPDATA%\Microsoft\Windows\Start Menu\Programs\Cure Interactive\Script
 #
-# Linux/macOS: NOT supported (warn + exit).
-#
-# Usage:
-#   python install_shortcut.py
-#
-# Notes:
-# - Uses PowerShell + WScript.Shell COM to create .lnk (no extra pip deps).
-# - Prefers pythonw.exe (if present) so GUI apps don’t spawn a console.
+# The tool records managed shortcuts in a manifest beside the .lnk files. Future
+# runs remove only shortcuts listed in that manifest when the matching app is no
+# longer available, so manually-created shortcuts in the same folder are left
+# alone.
 # =============================================================================
 
 from __future__ import annotations
 
+import datetime as dt
+import json
 import os
 import re
 import subprocess
@@ -34,19 +28,16 @@ from typing import Iterable, Optional
 
 APP_TITLE = "Install Shortcuts - Cure Interactive"
 
-# =============================================================================
-# Configuration
-# =============================================================================
-
 CURE_SUFFIX = " - Cure Interactive"
-
 START_MENU_REL = Path("Microsoft") / "Windows" / "Start Menu" / "Programs" / "Cure Interactive" / "Script"
+MANIFEST_FILENAME = "_install-shortcuts-manifest.json"
 
 APP_TITLE_REGEX = re.compile(
   r"""(?m)^\s*APP_TITLE\s*=\s*(?P<q>['"])(?P<title>.*?)(?P=q)\s*$""",
 )
 
 INVALID_FILENAME_CHARS = re.compile(r"""[<>:"/\\|?*\x00-\x1F]""")
+SKIP_DIR_NAMES = {".git", "__pycache__", ".venv", "venv", "node_modules"}
 
 
 @dataclass(frozen=True)
@@ -57,19 +48,9 @@ class ShortcutSpec:
   working_dir: Path
 
 
-# =============================================================================
-# Public API
-# =============================================================================
-
 def main(argv: list[str]) -> int:
   """
-  Entry point.
-
-  @param {list[str]} argv
-    Raw argv list, including program name.
-
-  @returns {int}
-    Process exit code (0 = success, nonzero = failure).
+  Sync Start Menu shortcuts for available Cure Interactive apps.
   """
   if os.name != "nt":
     print("[WARN] This shortcut installer only supports Windows.")
@@ -82,27 +63,29 @@ def main(argv: list[str]) -> int:
   start_menu_dir = resolve_start_menu_dir()
   start_menu_dir.mkdir(parents=True, exist_ok=True)
 
-  # No python exe needed; shortcut targets the .py directly
-  # python_exe = choose_python_executable(sys.executable)
-
-  # Build specs from scan (do not add this installer script)
-  specs: list[ShortcutSpec] = []
-
   scanned = list(scan_project_for_title_apps(project_root))
-  specs.extend(scanned)
-
-  # De-dupe by shortcut name (last one wins)
-  specs = dedupe_specs_by_name(specs)
+  specs = dedupe_specs_by_name(scanned)
 
   print(f"[INFO] Project root: {project_root}")
   print(f"[INFO] Start Menu dir: {start_menu_dir}")
-  # No python exe needed; shortcut targets the .py directly
-  # print(f"[INFO] Python target: {python_exe}")
-  print(f"[INFO] Found {len(scanned)} app(s) with self.title(...). Writing {len(specs)} shortcut(s)...")
+  print(f"[INFO] Found {len(scanned)} app(s) with APP_TITLE. Syncing {len(specs)} shortcut(s)...")
+
+  desired_shortcuts = {
+    shortcut_path_for_spec(start_menu_dir, spec)
+    for spec in specs
+    if spec.script_path.is_file()
+  }
+  removed = prune_stale_shortcuts(
+    start_menu_dir=start_menu_dir,
+    previous_manifest=load_manifest(start_menu_dir),
+    desired_shortcuts=desired_shortcuts,
+  )
 
   wrote = 0
+  installed: list[dict] = []
+
   for spec in specs:
-    lnk_path = start_menu_dir / (sanitize_filename(spec.name) + ".lnk")
+    lnk_path = shortcut_path_for_spec(start_menu_dir, spec)
 
     if not spec.script_path.is_file():
       print(f"[WARN] Skip (script missing): {spec.script_path}")
@@ -115,43 +98,28 @@ def main(argv: list[str]) -> int:
     try:
       create_windows_shortcut_via_powershell(
         shortcut_path=lnk_path,
-        # No python exe needed; shortcut targets the .py directly
-        # target_path=python_exe,
         target_path=str(spec.script_path),
-        arguments=str(spec.script_path),
+        arguments="",
         working_dir=spec.working_dir,
         icon_path=icon_loc if icon_loc.is_file() else None,
       )
       wrote += 1
+      installed.append(manifest_entry(spec, lnk_path, icon_loc))
       print(f"[OK] {lnk_path.name} -> {spec.script_path}")
     except Exception as e:
       print(f"[ERROR] Failed to create shortcut for '{spec.name}': {e}")
 
-  print(f"[DONE] Shortcuts written: {wrote}/{len(specs)}")
+  save_manifest(start_menu_dir, project_root=project_root, installed=installed)
+  print(f"[DONE] Shortcuts written: {wrote}/{len(specs)}; stale removed: {removed}")
   return 0 if wrote > 0 else 1
 
 
-# =============================================================================
-# Scanning
-# =============================================================================
-
 def scan_project_for_title_apps(project_root: Path) -> Iterable[ShortcutSpec]:
   """
-  Walk the project root recursively and find .py files containing APP_TITLE = "...".
-
-  Constraints:
-  - This script lives in install_shortcut/ so it scans *above* that folder.
-  - Each app is expected to have a sibling icon.ico next to its .py file.
-
-  @param {Path} project_root
-    Project root directory.
-
-  @yields {ShortcutSpec}
-    Shortcut specs for each discovered app.
+  Walk the project root and find .py files containing APP_TITLE = "...".
   """
   for path in walk_py_files(project_root):
-    # Skip common noise dirs
-    if any(part in {".git", "__pycache__", ".venv", "venv", "node_modules"} for part in path.parts):
+    if any(part in SKIP_DIR_NAMES for part in path.parts):
       continue
 
     try:
@@ -163,60 +131,27 @@ def scan_project_for_title_apps(project_root: Path) -> Iterable[ShortcutSpec]:
     if not title:
       continue
 
-    title_clean = strip_cure_suffix(title)
-    icon = path.parent / "icon.ico"
-
     yield ShortcutSpec(
-      name=title_clean,
+      name=strip_cure_suffix(title),
       script_path=path,
-      icon_path=icon,
+      icon_path=path.parent / "icon.ico",
       working_dir=path.parent,
     )
 
 
 def walk_py_files(root: Path) -> Iterable[Path]:
-  """
-  Recursively yield all .py files under root.
-
-  @param {Path} root
-    Root directory to walk.
-
-  @returns {Iterable[Path]}
-    Generator of file paths.
-  """
   yield from root.rglob("*.py")
 
 
 def extract_title(file_text: str) -> Optional[str]:
-  """
-  Extract the first recognized title.
-
-  Supported format:
-  - APP_TITLE = "..."
-
-  @param {str} file_text
-    File contents.
-
-  @returns {Optional[str]}
-    Title string if found.
-  """
   m = APP_TITLE_REGEX.search(file_text)
   if not m:
     return None
-  t = (m.group("title") or "").strip()
-  return t or None
+  title = (m.group("title") or "").strip()
+  return title or None
 
 
 def strip_cure_suffix(title: str) -> str:
-  """
-  Remove trailing " - Cure Interactive" from a window title.
-
-  @param {str} title
-    Original title.
-
-  @returns {str}
-    Clean title for shortcut naming.
-  """
   if title.endswith(CURE_SUFFIX):
     return title[: -len(CURE_SUFFIX)].rstrip()
   return title
@@ -224,87 +159,122 @@ def strip_cure_suffix(title: str) -> str:
 
 def dedupe_specs_by_name(specs: list[ShortcutSpec]) -> list[ShortcutSpec]:
   """
-  De-duplicate shortcut specs by name (case-insensitive). Last one wins.
-
-  @param {list[ShortcutSpec]} specs
-    Input list.
-
-  @returns {list[ShortcutSpec]}
-    De-duped list in original order (keeping the last occurrence).
+  De-duplicate shortcut specs by name, keeping the last match.
   """
   seen = {}
-  for i, s in enumerate(specs):
-    seen[s.name.lower()] = i
-  keep_idx = set(seen.values())
-  return [s for i, s in enumerate(specs) if i in keep_idx]
+  for index, spec in enumerate(specs):
+    seen[spec.name.lower()] = index
+  keep_indexes = set(seen.values())
+  return [spec for index, spec in enumerate(specs) if index in keep_indexes]
 
-
-# =============================================================================
-# Shortcut creation (PowerShell / WScript.Shell)
-# =============================================================================
 
 def resolve_start_menu_dir() -> Path:
-  """
-  Resolve the per-user Start Menu Programs\\Cure Interactive directory.
-
-  Uses %APPDATA% so it matches the active user.
-
-  @returns {Path}
-    Destination directory for shortcuts.
-  """
   appdata = os.environ.get("APPDATA")
   if not appdata:
     raise RuntimeError("APPDATA environment variable is missing; cannot resolve Start Menu path.")
   return Path(appdata) / START_MENU_REL
 
 
-# No python exe needed; shortcut targets the .py directly
-# def choose_python_executable(python_exe: str) -> str:
-#   """
-#   Prefer pythonw.exe when available to avoid a console window for GUI apps.
-
-#   @param {str} python_exe
-#     Current interpreter path (sys.executable).
-
-#   @returns {str}
-#     Path to pythonw.exe if found next to python.exe, else python_exe.
-#   """
-#   p = Path(python_exe)
-#   if p.name.lower() == "python.exe":
-#     pythonw = p.with_name("pythonw.exe")
-#     if pythonw.is_file():
-#       return str(pythonw)
-#   # If it’s already pythonw.exe or something else, keep it.
-#   return python_exe
-
-
 def sanitize_filename(name: str) -> str:
-  """
-  Produce a Windows-safe filename stem.
+  filename = INVALID_FILENAME_CHARS.sub("-", name).strip().strip(".")
+  return filename if filename else "Cure Interactive App"
 
-  @param {str} name
-    Desired name.
 
-  @returns {str}
-    Sanitized stem (no extension).
+def shortcut_path_for_spec(start_menu_dir: Path, spec: ShortcutSpec) -> Path:
+  return (start_menu_dir / (sanitize_filename(spec.name) + ".lnk")).resolve()
+
+
+def manifest_path(start_menu_dir: Path) -> Path:
+  return start_menu_dir / MANIFEST_FILENAME
+
+
+def load_manifest(start_menu_dir: Path) -> dict:
+  path = manifest_path(start_menu_dir)
+  if not path.is_file():
+    return {"version": 1, "shortcuts": []}
+
+  try:
+    data = json.loads(path.read_text(encoding="utf-8"))
+  except Exception:
+    return {"version": 1, "shortcuts": []}
+
+  if not isinstance(data, dict):
+    return {"version": 1, "shortcuts": []}
+  if not isinstance(data.get("shortcuts"), list):
+    data["shortcuts"] = []
+  return data
+
+
+def save_manifest(start_menu_dir: Path, *, project_root: Path, installed: list[dict]) -> None:
+  data = {
+    "version": 1,
+    "project_root": str(project_root),
+    "synced_at": dt.datetime.now().isoformat(timespec="seconds"),
+    "shortcuts": installed,
+  }
+  manifest_path(start_menu_dir).write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+
+
+def manifest_entry(spec: ShortcutSpec, shortcut_path: Path, icon_path: Path) -> dict:
+  return {
+    "name": spec.name,
+    "shortcut_path": str(shortcut_path),
+    "script_path": str(spec.script_path.resolve()),
+    "icon_path": str(icon_path.resolve()) if icon_path.is_file() else "",
+    "working_dir": str(spec.working_dir.resolve()),
+  }
+
+
+def prune_stale_shortcuts(
+  *,
+  start_menu_dir: Path,
+  previous_manifest: dict,
+  desired_shortcuts: set[Path],
+) -> int:
   """
-  s = INVALID_FILENAME_CHARS.sub("-", name).strip().strip(".")
-  # Prevent empty
-  return s if s else "Cure Interactive App"
+  Remove shortcuts this tool previously installed but no longer wants.
+  """
+  start_menu_root = start_menu_dir.resolve()
+  removed = 0
+
+  for entry in previous_manifest.get("shortcuts", []):
+    if not isinstance(entry, dict):
+      continue
+
+    raw_shortcut = str(entry.get("shortcut_path", "") or "")
+    if not raw_shortcut:
+      continue
+
+    try:
+      shortcut_path = Path(raw_shortcut).resolve()
+    except Exception:
+      continue
+
+    if shortcut_path in desired_shortcuts:
+      continue
+    if shortcut_path.suffix.lower() != ".lnk":
+      continue
+    if not is_relative_to(shortcut_path, start_menu_root):
+      continue
+    if not shortcut_path.exists():
+      continue
+
+    shortcut_path.unlink()
+    removed += 1
+    print(f"[OK] Removed stale shortcut: {shortcut_path.name}")
+
+  return removed
+
+
+def is_relative_to(path: Path, root: Path) -> bool:
+  try:
+    path.relative_to(root)
+    return True
+  except ValueError:
+    return False
 
 
 def ps_escape_single_quoted(value: str) -> str:
-  """
-  Escape a string for use inside a PowerShell single-quoted string.
-
-  PowerShell single-quote escaping is done by doubling single quotes.
-
-  @param {str} value
-    Raw value.
-
-  @returns {str}
-    Escaped value.
-  """
   return value.replace("'", "''")
 
 
@@ -318,42 +288,27 @@ def create_windows_shortcut_via_powershell(
 ) -> None:
   """
   Create or overwrite a .lnk shortcut using PowerShell + WScript.Shell.
-
-  @param {Path} shortcut_path
-    Full path to the .lnk file to create.
-  @param {str} target_path
-    Executable path (e.g., pythonw.exe).
-  @param {str} arguments
-    Arguments passed to target (we pass the .py script path).
-  @param {Path} working_dir
-    Working directory for the shortcut.
-  @param {Optional[Path]} icon_path
-    .ico file path; if None, icon is not set.
-
-  @returns {None}
   """
-  sp = ps_escape_single_quoted(str(shortcut_path))
-  tp = ps_escape_single_quoted(str(target_path))
-  arg = ps_escape_single_quoted(str(arguments))
-  wd = ps_escape_single_quoted(str(working_dir))
+  shortcut = ps_escape_single_quoted(str(shortcut_path))
+  target = ps_escape_single_quoted(str(target_path))
+  args = ps_escape_single_quoted(str(arguments))
+  workdir = ps_escape_single_quoted(str(working_dir))
 
-  # IconLocation format: "C:\path\icon.ico,0"
   icon_line = ""
   if icon_path:
-    ic = ps_escape_single_quoted(str(icon_path))
-    icon_line = f"$s.IconLocation = '{ic},0';"
+    icon = ps_escape_single_quoted(str(icon_path))
+    icon_line = f"$s.IconLocation = '{icon},0';"
 
   ps = (
     "$w = New-Object -ComObject WScript.Shell;"
-    f"$s = $w.CreateShortcut('{sp}');"
-    f"$s.TargetPath = '{tp}';"
-    f"$s.Arguments = '\"{arg}\"';"
-    f"$s.WorkingDirectory = '{wd}';"
+    f"$s = $w.CreateShortcut('{shortcut}');"
+    f"$s.TargetPath = '{target}';"
+    f"$s.Arguments = '{args}';"
+    f"$s.WorkingDirectory = '{workdir}';"
     + icon_line +
     "$s.Save();"
   )
 
-  # Use -Command with a compact one-liner to avoid temp files.
   subprocess.run(
     ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps],
     check=True,
@@ -362,10 +317,6 @@ def create_windows_shortcut_via_powershell(
     text=True,
   )
 
-
-# =============================================================================
-# Bootstrap
-# =============================================================================
 
 if __name__ == "__main__":
   raise SystemExit(main(sys.argv))
